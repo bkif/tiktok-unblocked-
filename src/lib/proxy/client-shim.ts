@@ -3,7 +3,8 @@ import { ALLOWED_DOMAIN_SUFFIXES, VERCEL_PAYLOAD_LIMIT_BYTES } from "./config";
 /**
  * Generates the self-contained client-side runtime shim injected into proxied
  * HTML <head> so dynamic TikTok/ByteDance requests, cross-frame postMessage
- * handshakes, modal fallback controls, and uploads stay inside the Vercel proxy tunnel.
+ * handshakes, ServiceWorker stubbing, feed scroll unlocking, quick-action pill
+ * controls, and uploads stay functional inside the Vercel proxy tunnel.
  */
 export function buildClientShimScript(): string {
   const suffixesJson = JSON.stringify(ALLOWED_DOMAIN_SUFFIXES);
@@ -94,13 +95,97 @@ export function buildClientShimScript(): string {
     return url;
   }
 
+  function isElementVisiblyRendered(el) {
+    if (!el || !el.getBoundingClientRect) return false;
+    var style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+    if (style) {
+      if (style.display === "none" || style.visibility === "hidden") return false;
+      if (parseFloat(style.opacity || "1") <= 0.01) return false;
+    }
+    var rect = el.getBoundingClientRect();
+    return rect.width > 20 && rect.height > 20;
+  }
+
+  function hasVisibleDialog() {
+    try {
+      var dialogs = document.querySelectorAll('[role="dialog"], [aria-modal="true"]');
+      for (var i = 0; i < dialogs.length; i++) {
+        var dlg = dialogs[i];
+        if (!dlg || dlg.id === PILL_ID || (dlg.closest && dlg.closest("#" + PILL_ID))) {
+          continue;
+        }
+        if (!isElementVisiblyRendered(dlg)) continue;
+        var hasContent =
+          (dlg.textContent && dlg.textContent.trim().length > 0) ||
+          !!dlg.querySelector("iframe, input, button, canvas, video");
+        if (hasContent) return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  function restoreDocumentScroll() {
+    try {
+      var docEl = document.documentElement;
+      var body = document.body;
+      var targets = [docEl, body];
+      for (var i = 0; i < targets.length; i++) {
+        var node = targets[i];
+        if (!node) continue;
+        var cs = window.getComputedStyle ? window.getComputedStyle(node) : null;
+        if (node.style.overflow === "hidden" || (cs && cs.overflow === "hidden")) {
+          node.style.overflow = "auto";
+        }
+        if (node.style.overflowY === "hidden" || (cs && cs.overflowY === "hidden")) {
+          node.style.overflowY = "auto";
+        }
+        if (node.style.position === "fixed" || (cs && cs.position === "fixed")) {
+          node.style.position = "static";
+        }
+        node.style.touchAction = "pan-y";
+      }
+    } catch (_) {}
+  }
+
+  function neutralizeEmptyOverlays() {
+    try {
+      var masks = document.querySelectorAll(
+        '#login-modal, [class*="ModalMask"], [class*="Overlay"]'
+      );
+      for (var i = 0; i < masks.length; i++) {
+        var el = masks[i];
+        if (!el || el.id === PILL_ID || (el.closest && el.closest("#" + PILL_ID))) {
+          continue;
+        }
+        var cs = window.getComputedStyle ? window.getComputedStyle(el) : null;
+        var hiddenOrEmpty =
+          (cs && (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity || "1") <= 0.01)) ||
+          (!el.querySelector("iframe, input, button, canvas") &&
+            (!el.textContent || el.textContent.trim().length === 0));
+        if (hiddenOrEmpty) {
+          el.style.pointerEvents = "none";
+        }
+      }
+    } catch (_) {}
+  }
+
+  function unlockScrollIfNoDialog() {
+    if (hasVisibleDialog()) return;
+    restoreDocumentScroll();
+    neutralizeEmptyOverlays();
+  }
+
   function forceCloseStuckModals() {
     try {
       var selectors = [
         '[role="dialog"]',
+        '[aria-modal="true"]',
+        '#login-modal',
         '[id*="login"]',
+        '[class*="ModalMask"]',
         '[class*="Modal"]',
         '[class*="modal"]',
+        '[class*="Overlay"]',
         '[data-e2e="modal-close-inner-button"]'
       ];
       var nodes = document.querySelectorAll(selectors.join(","));
@@ -128,12 +213,37 @@ export function buildClientShimScript(): string {
       }
       if (document.body) {
         document.body.style.overflow = "auto";
+        document.body.style.overflowY = "auto";
+        document.body.style.position = "static";
         document.body.style.pointerEvents = "auto";
+        document.body.style.touchAction = "pan-y";
       }
       if (document.documentElement) {
         document.documentElement.style.overflow = "auto";
+        document.documentElement.style.overflowY = "auto";
+        document.documentElement.style.position = "static";
+        document.documentElement.style.touchAction = "pan-y";
       }
     } catch (_) {}
+  }
+
+  function makePillButton(label, bgColor, borderColor) {
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = label;
+    btn.style.cssText = [
+      "background:" + bgColor,
+      "color:#fff",
+      "border:1px solid " + borderColor,
+      "border-radius:9999px",
+      "padding:3px 9px",
+      "font-size:11px",
+      "font-weight:600",
+      "cursor:pointer",
+      "white-space:nowrap",
+      "flex-shrink:0"
+    ].join(";");
+    return btn;
   }
 
   function ensureGatewayPill(warningText) {
@@ -150,9 +260,10 @@ export function buildClientShimScript(): string {
         pill.style.cssText = [
           "position:fixed",
           "bottom:14px",
-          "right:14px",
+          "left:14px",
           "z-index:2147483647",
-          "max-width:440px",
+          "max-width:calc(100vw - 28px)",
+          "flex-wrap:wrap",
           "background:rgba(18,18,22,0.92)",
           "color:#fff",
           "border:1px solid rgba(255,255,255,0.16)",
@@ -163,40 +274,36 @@ export function buildClientShimScript(): string {
           "line-height:1.35",
           "display:flex",
           "align-items:center",
-          "gap:8px",
+          "gap:6px",
           "box-shadow:0 8px 24px rgba(0,0,0,0.35)",
           "backdrop-filter:blur(8px)"
         ].join(";");
 
-        var textSpan = document.createElement("span");
-        textSpan.id = PILL_ID + "-text";
-        textSpan.textContent = "Gateway active";
-        textSpan.style.cssText = "opacity:0.9;";
+        var qrBtn = makePillButton("Connexion / QR", "rgba(254,44,85,0.9)", "rgba(254,44,85,0.95)");
+        qrBtn.onclick = function () {
+          window.location.assign("/login/qrcode");
+        };
 
-        var unblockBtn = document.createElement("button");
-        unblockBtn.type = "button";
-        unblockBtn.textContent = "Débloquer / Fermer popup";
-        unblockBtn.style.cssText = [
-          "background:rgba(255,255,255,0.14)",
-          "color:#fff",
-          "border:1px solid rgba(255,255,255,0.22)",
-          "border-radius:9999px",
-          "padding:3px 9px",
-          "font-size:11px",
-          "font-weight:600",
-          "cursor:pointer",
-          "flex-shrink:0"
-        ].join(";");
-        unblockBtn.onclick = function () {
+        var unlockBtn = makePillButton("Débloquer Scroll", "rgba(255,255,255,0.14)", "rgba(255,255,255,0.22)");
+        unlockBtn.onclick = function () {
           forceCloseStuckModals();
         };
+
+        var uploadBtn = makePillButton("Upload", "rgba(37,244,238,0.18)", "rgba(37,244,238,0.4)");
+        uploadBtn.onclick = function () {
+          window.location.assign("/creator-center/upload");
+        };
+
+        var textSpan = document.createElement("span");
+        textSpan.id = PILL_ID + "-text";
+        textSpan.style.cssText = "opacity:0.9;display:none;margin-left:2px;";
 
         var closeBtn = document.createElement("button");
         closeBtn.type = "button";
         closeBtn.textContent = "×";
         closeBtn.setAttribute("aria-label", "Dismiss gateway pill");
         closeBtn.style.cssText = [
-          "background:#fe2c55",
+          "background:rgba(255,255,255,0.14)",
           "color:#fff",
           "border:none",
           "border-radius:9999px",
@@ -214,8 +321,10 @@ export function buildClientShimScript(): string {
           pill.remove();
         };
 
+        pill.appendChild(qrBtn);
+        pill.appendChild(unlockBtn);
+        pill.appendChild(uploadBtn);
         pill.appendChild(textSpan);
-        pill.appendChild(unblockBtn);
         pill.appendChild(closeBtn);
         root.appendChild(pill);
       }
@@ -224,6 +333,7 @@ export function buildClientShimScript(): string {
         pill.style.borderColor = "rgba(254,44,85,0.75)";
         var label = document.getElementById(PILL_ID + "-text");
         if (label) {
+          label.style.display = "inline";
           label.textContent = warningText;
         }
       }
@@ -280,7 +390,36 @@ export function buildClientShimScript(): string {
     } catch (_) {}
   }
 
-  // 1. Bridge cross-frame postMessage & MessageEvent.origin for TikTok modals
+  // 1. Stub ServiceWorker registration & override document.referrer
+  if (typeof navigator !== "undefined" && navigator.serviceWorker) {
+    try {
+      Object.defineProperty(navigator.serviceWorker, "register", {
+        configurable: true,
+        value: function () {
+          return Promise.resolve({});
+        }
+      });
+    } catch (_) {
+      try {
+        navigator.serviceWorker.register = function () {
+          return Promise.resolve({});
+        };
+      } catch (_) {}
+    }
+  }
+
+  if (typeof Document !== "undefined") {
+    try {
+      Object.defineProperty(Document.prototype, "referrer", {
+        configurable: true,
+        get: function () {
+          return "https://www.tiktok.com/";
+        }
+      });
+    } catch (_) {}
+  }
+
+  // 2. Bridge cross-frame postMessage & MessageEvent.origin for TikTok modals
   function normalizeTargetOrigin(targetOriginOrOptions) {
     var localOrigin = window.location.origin && window.location.origin !== "null"
       ? window.location.origin
@@ -374,41 +513,74 @@ export function buildClientShimScript(): string {
     } catch (_) {}
   }
 
-  // 2. Patch window.fetch
+  // 3. Patch window.fetch (with credentials: "include" for proxied/local cookies)
   if (typeof window.fetch === "function") {
     var origFetch = window.fetch;
     window.fetch = function (input, init) {
+      var nextInit = init;
       try {
         if (init && init.body) {
           inspectBodySize(init.body);
         }
+        var targetUrl = "";
         if (typeof input === "string") {
           input = rewriteUrl(input);
+          targetUrl = input;
         } else if (input instanceof URL) {
           input = rewriteUrl(input.toString());
+          targetUrl = input;
         } else if (typeof Request !== "undefined" && input instanceof Request) {
           var rewritten = rewriteUrl(input.url);
+          targetUrl = rewritten;
           if (rewritten !== input.url) {
-            input = new Request(rewritten, input);
+            input = new Request(rewritten, {
+              method: input.method,
+              headers: input.headers,
+              body: input.body,
+              mode: input.mode === "navigate" ? "same-origin" : input.mode,
+              credentials: "include",
+              cache: input.cache,
+              redirect: input.redirect,
+              referrer: input.referrer,
+              referrerPolicy: input.referrerPolicy
+            });
           }
         }
+        if (
+          targetUrl &&
+          (targetUrl.startsWith("/") || targetUrl.startsWith(window.location.origin))
+        ) {
+          nextInit = Object.assign({}, init || {}, { credentials: "include" });
+        }
       } catch (_) {}
-      return origFetch.call(this, input, init);
+      return origFetch.call(this, input, nextInit);
     };
   }
 
-  // 3. Patch XMLHttpRequest.prototype.open & send
+  // 4. Patch XMLHttpRequest.prototype.open & send
   if (typeof XMLHttpRequest !== "undefined") {
     var origOpen = XMLHttpRequest.prototype.open;
     var origSend = XMLHttpRequest.prototype.send;
     XMLHttpRequest.prototype.open = function (method, url) {
       var args = Array.prototype.slice.call(arguments);
+      var rewrittenUrl = "";
       if (typeof url === "string") {
-        args[1] = rewriteUrl(url);
+        rewrittenUrl = rewriteUrl(url);
+        args[1] = rewrittenUrl;
       } else if (url && typeof url.toString === "function") {
-        args[1] = rewriteUrl(url.toString());
+        rewrittenUrl = rewriteUrl(url.toString());
+        args[1] = rewrittenUrl;
       }
-      return origOpen.apply(this, args);
+      var res = origOpen.apply(this, args);
+      try {
+        if (
+          rewrittenUrl &&
+          (rewrittenUrl.startsWith("/") || rewrittenUrl.startsWith(window.location.origin))
+        ) {
+          this.withCredentials = true;
+        }
+      } catch (_) {}
+      return res;
     };
     XMLHttpRequest.prototype.send = function (body) {
       if (body) inspectBodySize(body);
@@ -416,7 +588,7 @@ export function buildClientShimScript(): string {
     };
   }
 
-  // 4. Patch navigator.sendBeacon
+  // 5. Patch navigator.sendBeacon
   if (typeof navigator !== "undefined" && typeof navigator.sendBeacon === "function") {
     var origBeacon = navigator.sendBeacon.bind(navigator);
     navigator.sendBeacon = function (url, data) {
@@ -424,7 +596,7 @@ export function buildClientShimScript(): string {
     };
   }
 
-  // 5. Patch Worker
+  // 6. Patch Worker
   if (typeof window.Worker === "function") {
     var OrigWorker = window.Worker;
     window.Worker = function (scriptURL, options) {
@@ -434,7 +606,7 @@ export function buildClientShimScript(): string {
     window.Worker.prototype = OrigWorker.prototype;
   }
 
-  // 6. Patch window.open & History API
+  // 7. Patch window.open & History API
   if (typeof window.open === "function") {
     var origWindowOpen = window.open;
     window.open = function (url, target, features) {
@@ -458,7 +630,7 @@ export function buildClientShimScript(): string {
     }
   }
 
-  // 7. Patch DOM src / href setters & setAttribute (and strip SRI integrity)
+  // 8. Patch DOM src / href / action setters & setAttribute (and strip SRI integrity)
   function patchProp(proto, prop) {
     if (!proto) return;
     var desc = Object.getOwnPropertyDescriptor(proto, prop);
@@ -482,6 +654,19 @@ export function buildClientShimScript(): string {
   if (typeof HTMLSourceElement !== "undefined") patchProp(HTMLSourceElement.prototype, "src");
   if (typeof HTMLIFrameElement !== "undefined") patchProp(HTMLIFrameElement.prototype, "src");
   if (typeof HTMLLinkElement !== "undefined") patchProp(HTMLLinkElement.prototype, "href");
+  if (typeof HTMLFormElement !== "undefined") {
+    patchProp(HTMLFormElement.prototype, "action");
+    if (typeof HTMLFormElement.prototype.submit === "function") {
+      var origFormSubmit = HTMLFormElement.prototype.submit;
+      HTMLFormElement.prototype.submit = function () {
+        try {
+          var act = this.getAttribute("action");
+          if (act) this.setAttribute("action", rewriteUrl(act));
+        } catch (_) {}
+        return origFormSubmit.call(this);
+      };
+    }
+  }
 
   if (typeof Element !== "undefined" && Element.prototype.setAttribute) {
     var origSetAttr = Element.prototype.setAttribute;
@@ -490,14 +675,14 @@ export function buildClientShimScript(): string {
       if (lower === "integrity" || lower === "crossorigin") {
         return;
       }
-      if ((lower === "src" || lower === "href") && typeof value === "string") {
+      if ((lower === "src" || lower === "href" || lower === "action") && typeof value === "string") {
         value = rewriteUrl(value);
       }
       return origSetAttr.call(this, name, value);
     };
   }
 
-  // 8. Monitor file input selection & initialize floating gateway status pill
+  // 9. Monitor file input selection, form submissions, scroll-lock observer & pill init
   if (typeof document !== "undefined") {
     document.addEventListener(
       "change",
@@ -517,11 +702,65 @@ export function buildClientShimScript(): string {
       true
     );
 
+    document.addEventListener(
+      "submit",
+      function (event) {
+        var form = event.target;
+        if (!form || form.tagName !== "FORM") return;
+        try {
+          var action = form.getAttribute("action");
+          if (action) {
+            form.setAttribute("action", rewriteUrl(action));
+          }
+        } catch (_) {}
+      },
+      true
+    );
+
+    var scrollUnlockQueued = false;
+    function scheduleScrollUnlock() {
+      if (scrollUnlockQueued) return;
+      scrollUnlockQueued = true;
+      var run = function () {
+        scrollUnlockQueued = false;
+        unlockScrollIfNoDialog();
+      };
+      if (typeof window.requestAnimationFrame === "function") {
+        window.requestAnimationFrame(run);
+      } else {
+        setTimeout(run, 16);
+      }
+    }
+
+    if (typeof MutationObserver !== "undefined" && document.documentElement) {
+      var observer = new MutationObserver(scheduleScrollUnlock);
+      observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["style", "class"]
+      });
+    }
+
+    window.addEventListener("wheel", unlockScrollIfNoDialog, { capture: true, passive: true });
+    window.addEventListener("touchmove", unlockScrollIfNoDialog, { capture: true, passive: true });
+    window.addEventListener(
+      "keydown",
+      function (e) {
+        if (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "PageDown" || e.key === "PageUp") {
+          unlockScrollIfNoDialog();
+        }
+      },
+      true
+    );
+
     if (document.readyState === "loading") {
       document.addEventListener("DOMContentLoaded", function () {
+        unlockScrollIfNoDialog();
         ensureGatewayPill(null);
       });
     } else {
+      unlockScrollIfNoDialog();
       ensureGatewayPill(null);
     }
   }

@@ -31,6 +31,7 @@ export const ALLOWED_DOMAIN_SUFFIXES: readonly string[] = [
   "ibyteimg.com",
   "muscdn.com",
   "snssdk.com",
+  "sgsnssdk.com",
 ];
 
 const HOSTNAME_REGEX =
