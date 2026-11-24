@@ -9,12 +9,23 @@ import {
   rewriteResponseHeaders,
 } from "./rewriter";
 
-type FetchInitWithDuplex = RequestInit & {
-  duplex?: "half";
-};
-
 const METHODS_WITHOUT_BODY = new Set<string>(["GET", "HEAD"]);
 const STATUS_WITHOUT_BODY = new Set<number>([204, 205, 304]);
+
+function getRawSearch(req: NextRequest): string {
+  const qIdx = req.url.indexOf("?");
+  if (qIdx !== -1) {
+    return req.url.slice(qIdx);
+  }
+  return req.nextUrl.search;
+}
+
+function shouldForceNoStore(targetPath: string): boolean {
+  return (
+    targetPath.startsWith("/passport/") ||
+    targetPath.startsWith("/api/")
+  );
+}
 
 /**
  * Executes a transparent reverse-proxy request to an allowlisted TikTok/ByteDance host.
@@ -32,23 +43,28 @@ export async function proxyRequest(
   }
 
   const normalizedPath = targetPath.startsWith("/") ? targetPath : `/${targetPath}`;
-  const search = req.nextUrl.search;
-  const upstreamUrl = `https://${targetHost}${normalizedPath}${search}`;
+  const rawSearch = getRawSearch(req);
+  const upstreamUrl = `https://${targetHost}${normalizedPath}${rawSearch}`;
 
-  const upstreamHeaders = buildUpstreamHeaders(req.headers, targetHost);
+  const upstreamHeaders = buildUpstreamHeaders(
+    req.headers,
+    targetHost,
+    normalizedPath
+  );
   const method = req.method.toUpperCase();
-  const hasBody = !METHODS_WITHOUT_BODY.has(method) && req.body !== null;
 
-  const fetchInit: FetchInitWithDuplex = {
+  const fetchInit: RequestInit = {
     method,
     headers: upstreamHeaders,
     redirect: "manual",
     cache: "no-store",
   };
 
-  if (hasBody && req.body) {
-    fetchInit.body = req.body;
-    fetchInit.duplex = "half";
+  if (!METHODS_WITHOUT_BODY.has(method)) {
+    const rawBody = await req.arrayBuffer();
+    if (rawBody.byteLength > 0) {
+      fetchInit.body = rawBody;
+    }
   }
 
   let upstreamRes: Response;
@@ -69,9 +85,17 @@ export async function proxyRequest(
   const contentType = upstreamRes.headers.get("content-type") ?? "";
   const isNoBodyResponse =
     method === "HEAD" || STATUS_WITHOUT_BODY.has(upstreamRes.status);
+  const headerOptions = {
+    forceNoStore: shouldForceNoStore(normalizedPath),
+  };
 
   if (isNoBodyResponse) {
-    const headers = rewriteResponseHeaders(upstreamRes.headers, targetHost, false);
+    const headers = rewriteResponseHeaders(
+      upstreamRes.headers,
+      targetHost,
+      false,
+      headerOptions
+    );
     return new Response(null, {
       status: upstreamRes.status,
       statusText: upstreamRes.statusText,
@@ -82,7 +106,12 @@ export async function proxyRequest(
   if (isHtmlContentType(contentType)) {
     const rawHtml = await upstreamRes.text();
     const rewrittenHtml = rewriteHtmlDocument(rawHtml);
-    const headers = rewriteResponseHeaders(upstreamRes.headers, targetHost, true);
+    const headers = rewriteResponseHeaders(
+      upstreamRes.headers,
+      targetHost,
+      true,
+      headerOptions
+    );
     return new Response(rewrittenHtml, {
       status: upstreamRes.status,
       statusText: upstreamRes.statusText,
@@ -93,7 +122,12 @@ export async function proxyRequest(
   if (isRewritableTextContentType(contentType)) {
     const rawText = await upstreamRes.text();
     const rewrittenText = rewriteProxyUrlsInText(rawText);
-    const headers = rewriteResponseHeaders(upstreamRes.headers, targetHost, true);
+    const headers = rewriteResponseHeaders(
+      upstreamRes.headers,
+      targetHost,
+      true,
+      headerOptions
+    );
     return new Response(rewrittenText, {
       status: upstreamRes.status,
       statusText: upstreamRes.statusText,
@@ -105,7 +139,8 @@ export async function proxyRequest(
   const headers = rewriteResponseHeaders(
     upstreamRes.headers,
     targetHost,
-    wasCompressed
+    wasCompressed,
+    headerOptions
   );
 
   return new Response(upstreamRes.body, {

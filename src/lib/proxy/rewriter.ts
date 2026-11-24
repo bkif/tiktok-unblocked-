@@ -11,6 +11,7 @@ const STRIPPED_REQUEST_HEADERS = new Set<string>([
   "host",
   "origin",
   "referer",
+  "content-length",
   "connection",
   "keep-alive",
   "transfer-encoding",
@@ -63,14 +64,19 @@ const SCRIPT_OR_LINK_TAG_REGEX = /<(script|link)\b([^>]*)>/gi;
 const INTEGRITY_OR_CROSSORIGIN_ATTR_REGEX =
   /\s+(?:integrity|crossorigin)(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+))?/gi;
 
+export interface RewriteResponseHeaderOptions {
+  forceNoStore?: boolean;
+}
+
 /**
- * Builds sanitized upstream request headers, stripping Vercel/proxy headers
- * and force-setting Origin and Referer to https://www.tiktok.com so TikTok
- * Passport and modal APIs never reject requests coming from *.vercel.app.
+ * Builds sanitized upstream request headers, stripping Vercel/proxy headers,
+ * preserving all TikTok auth/signature headers (x-tt-*, x-secsdk-*, x-bogus,
+ * tt-csrf-token), and force-setting Origin and Referer to https://www.tiktok.com.
  */
 export function buildUpstreamHeaders(
   incomingHeaders: Headers,
-  targetHost: string
+  targetHost: string,
+  targetPath = "/"
 ): Headers {
   const out = new Headers();
 
@@ -89,7 +95,10 @@ export function buildUpstreamHeaders(
 
   out.set("host", targetHost);
   out.set("origin", UPSTREAM_SPOOFED_ORIGIN);
-  out.set("referer", rewriteIncomingReferer(incomingHeaders.get("referer")));
+  out.set(
+    "referer",
+    rewriteIncomingReferer(incomingHeaders.get("referer"), targetPath)
+  );
   return out;
 }
 
@@ -107,22 +116,30 @@ function stripProxyPrefixPath(pathname: string): string {
   return pathname || "/";
 }
 
-function rewriteIncomingReferer(rawReferer: string | null): string {
+function rewriteIncomingReferer(
+  rawReferer: string | null,
+  fallbackTargetPath: string
+): string {
+  const safeFallback = fallbackTargetPath.startsWith("/")
+    ? fallbackTargetPath
+    : `/${fallbackTargetPath}`;
   if (!rawReferer) {
-    return `${UPSTREAM_SPOOFED_ORIGIN}/`;
+    return `${UPSTREAM_SPOOFED_ORIGIN}${safeFallback}`;
   }
   try {
     const parsed = new URL(rawReferer);
     const originalPath = stripProxyPrefixPath(parsed.pathname);
     return `${UPSTREAM_SPOOFED_ORIGIN}${originalPath}${parsed.search}`;
   } catch {
-    return `${UPSTREAM_SPOOFED_ORIGIN}/`;
+    return `${UPSTREAM_SPOOFED_ORIGIN}${safeFallback}`;
   }
 }
 
 /**
- * Rewrites a single Set-Cookie header so it is scoped to the Vercel host
- * with SameSite=None; Secure while preserving HttpOnly and Path=/.
+ * Rewrites a single Set-Cookie header so it binds to the Vercel proxy host
+ * with Path=/, sets SameSite=None; Secure if Secure was present (otherwise
+ * SameSite=Lax), and strictly preserves the original HttpOnly presence/absence
+ * so client-side JS can read cookies like passport_csrf_token.
  */
 export function rewriteSetCookie(rawCookie: string): string {
   const parts = rawCookie.split(";").map((part) => part.trim());
@@ -132,7 +149,8 @@ export function rewriteSetCookie(rawCookie: string): string {
   }
 
   const attributes: string[] = [];
-  let hasPath = false;
+  let hasSecure = false;
+  let hasHttpOnly = false;
 
   for (let i = 1; i < parts.length; i++) {
     const attr = parts[i];
@@ -142,25 +160,34 @@ export function rewriteSetCookie(rawCookie: string): string {
       .trim()
       .toLowerCase();
 
-    if (attrName === "domain") {
-      // Strip Domain=... so the cookie binds to the Vercel proxy host
+    if (
+      attrName === "domain" ||
+      attrName === "path" ||
+      attrName === "samesite"
+    ) {
       continue;
     }
-    if (attrName === "samesite" || attrName === "secure") {
-      // Normalized below to SameSite=None; Secure
+    if (attrName === "secure") {
+      hasSecure = true;
       continue;
     }
-    if (attrName === "path") {
-      hasPath = true;
+    if (attrName === "httponly") {
+      hasHttpOnly = true;
+      continue;
     }
     attributes.push(attr);
   }
 
-  if (!hasPath) {
-    attributes.push("Path=/");
+  attributes.push("Path=/");
+  if (hasHttpOnly) {
+    attributes.push("HttpOnly");
   }
-  attributes.push("SameSite=None");
-  attributes.push("Secure");
+  if (hasSecure) {
+    attributes.push("SameSite=None");
+    attributes.push("Secure");
+  } else {
+    attributes.push("SameSite=Lax");
+  }
 
   return [nameValue, ...attributes].join("; ");
 }
@@ -199,12 +226,13 @@ export function rewriteLocationHeader(
 
 /**
  * Rewrites upstream response headers: strips CSP/XFO/HSTS/COOP/COEP,
- * rewrites Location redirects, and rewrites Set-Cookie headers.
+ * rewrites Location redirects, and rewrites Set-Cookie headers individually.
  */
 export function rewriteResponseHeaders(
   upstreamHeaders: Headers,
   currentUpstreamHost: string,
-  bodyRewritten: boolean
+  bodyRewritten: boolean,
+  options?: RewriteResponseHeaderOptions
 ): Headers {
   const out = new Headers();
 
@@ -226,6 +254,12 @@ export function rewriteResponseHeaders(
     out.set(key, value);
   });
 
+  if (options?.forceNoStore) {
+    out.set("cache-control", "no-store, no-cache, must-revalidate");
+    out.set("pragma", "no-cache");
+    out.set("expires", "0");
+  }
+
   const setCookies =
     typeof upstreamHeaders.getSetCookie === "function"
       ? upstreamHeaders.getSetCookie()
@@ -233,12 +267,12 @@ export function rewriteResponseHeaders(
 
   if (setCookies.length > 0) {
     for (const cookie of setCookies) {
-      out.append("set-cookie", rewriteSetCookie(cookie));
+      out.append("Set-Cookie", rewriteSetCookie(cookie));
     }
   } else {
     const singleCookie = upstreamHeaders.get("set-cookie");
     if (singleCookie) {
-      out.append("set-cookie", rewriteSetCookie(singleCookie));
+      out.append("Set-Cookie", rewriteSetCookie(singleCookie));
     }
   }
 
