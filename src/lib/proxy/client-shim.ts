@@ -65,7 +65,16 @@ export function buildClientShimScript(): string {
         return input;
       }
       var parsed = new URL(normalized);
-      if (parsed.origin === origin) {
+      if (parsed.hostname === "_proxy") {
+        var fixedPath = parsed.pathname.replace(/^\\/+/, "");
+        if (fixedPath) {
+          return PROXY_PREFIX + fixedPath + parsed.search + parsed.hash;
+        }
+      }
+      if (parsed.host === window.location.host) {
+        if (parsed.protocol !== window.location.protocol) {
+          return (parsed.pathname || "/") + parsed.search + parsed.hash;
+        }
         return input;
       }
       if (isAllowedHost(parsed.hostname)) {
@@ -128,6 +137,7 @@ export function buildClientShimScript(): string {
     try {
       var docEl = document.documentElement;
       var body = document.body;
+      var appEl = document.getElementById("app");
       var targets = [docEl, body];
       for (var i = 0; i < targets.length; i++) {
         var node = targets[i];
@@ -142,7 +152,19 @@ export function buildClientShimScript(): string {
         if (node.style.position === "fixed" || (cs && cs.position === "fixed")) {
           node.style.position = "static";
         }
+        if (node.style.pointerEvents === "none" || (cs && cs.pointerEvents === "none")) {
+          node.style.pointerEvents = "auto";
+        }
         node.style.touchAction = "pan-y";
+      }
+      if (appEl) {
+        var appCs = window.getComputedStyle ? window.getComputedStyle(appEl) : null;
+        if (appEl.style.pointerEvents === "none" || (appCs && appCs.pointerEvents === "none")) {
+          appEl.style.pointerEvents = "auto";
+        }
+        if (appEl.hasAttribute("inert")) {
+          appEl.removeAttribute("inert");
+        }
       }
     } catch (_) {}
   }
@@ -222,7 +244,13 @@ export function buildClientShimScript(): string {
         document.documentElement.style.overflow = "auto";
         document.documentElement.style.overflowY = "auto";
         document.documentElement.style.position = "static";
+        document.documentElement.style.pointerEvents = "auto";
         document.documentElement.style.touchAction = "pan-y";
+      }
+      var appEl = document.getElementById("app");
+      if (appEl) {
+        appEl.style.pointerEvents = "auto";
+        appEl.removeAttribute("inert");
       }
     } catch (_) {}
   }
@@ -513,7 +541,61 @@ export function buildClientShimScript(): string {
     } catch (_) {}
   }
 
-  // 3. Patch window.fetch (with credentials: "include" for proxied/local cookies)
+  // 3. Patch window.URL for single-arg /_proxy/... strings & window.Request constructor
+  if (typeof window.URL === "function") {
+    var OrigURL = window.URL;
+    var PatchedURL = function (url, base) {
+      if (
+        arguments.length === 1 &&
+        typeof url === "string" &&
+        url.indexOf(PROXY_PREFIX) === 0
+      ) {
+        return new OrigURL(url, window.location.origin);
+      }
+      if (arguments.length >= 2) {
+        return new OrigURL(url, base);
+      }
+      return new OrigURL(url);
+    };
+    PatchedURL.prototype = OrigURL.prototype;
+    PatchedURL.createObjectURL = OrigURL.createObjectURL.bind(OrigURL);
+    PatchedURL.revokeObjectURL = OrigURL.revokeObjectURL.bind(OrigURL);
+    if (typeof OrigURL.canParse === "function") {
+      PatchedURL.canParse = OrigURL.canParse.bind(OrigURL);
+    }
+    window.URL = PatchedURL;
+  }
+
+  var OrigRequest = typeof window.Request === "function" ? window.Request : null;
+  if (OrigRequest) {
+    var PatchedRequest = function (input, init) {
+      var nextInput = input;
+      var nextInit = init;
+      if (typeof input === "string") {
+        nextInput = rewriteUrl(input);
+      } else if (input instanceof URL) {
+        nextInput = rewriteUrl(input.toString());
+      }
+      if (nextInit && typeof nextInit === "object" && typeof nextInit.referrer === "string") {
+        if (/^https?:\\/\\//i.test(nextInit.referrer) && nextInit.referrer.indexOf(window.location.origin) !== 0) {
+          var clonedInit = {};
+          for (var rk in nextInit) {
+            if (Object.prototype.hasOwnProperty.call(nextInit, rk) && rk !== "referrer") {
+              clonedInit[rk] = nextInit[rk];
+            }
+          }
+          nextInit = clonedInit;
+        }
+      }
+      return arguments.length >= 2
+        ? new OrigRequest(nextInput, nextInit)
+        : new OrigRequest(nextInput);
+    };
+    PatchedRequest.prototype = OrigRequest.prototype;
+    window.Request = PatchedRequest;
+  }
+
+  // 4. Patch window.fetch (with safe Request reconstruction & credentials: "include")
   if (typeof window.fetch === "function") {
     var origFetch = window.fetch;
     window.fetch = function (input, init) {
@@ -529,21 +611,25 @@ export function buildClientShimScript(): string {
         } else if (input instanceof URL) {
           input = rewriteUrl(input.toString());
           targetUrl = input;
-        } else if (typeof Request !== "undefined" && input instanceof Request) {
+        } else if (OrigRequest && input instanceof OrigRequest) {
           var rewritten = rewriteUrl(input.url);
           targetUrl = rewritten;
           if (rewritten !== input.url) {
-            input = new Request(rewritten, {
-              method: input.method,
+            var reqMethod = (input.method || "GET").toUpperCase();
+            var hasReqBody = reqMethod !== "GET" && reqMethod !== "HEAD" && input.body !== null;
+            var reqOpts = {
+              method: reqMethod,
               headers: input.headers,
-              body: input.body,
               mode: input.mode === "navigate" ? "same-origin" : input.mode,
               credentials: "include",
               cache: input.cache,
-              redirect: input.redirect,
-              referrer: input.referrer,
-              referrerPolicy: input.referrerPolicy
-            });
+              redirect: input.redirect
+            };
+            if (hasReqBody) {
+              reqOpts.body = input.body;
+              reqOpts.duplex = "half";
+            }
+            input = new OrigRequest(rewritten, reqOpts);
           }
         }
         if (
@@ -557,7 +643,7 @@ export function buildClientShimScript(): string {
     };
   }
 
-  // 4. Patch XMLHttpRequest.prototype.open & send
+  // 5. Patch XMLHttpRequest.prototype.open & send
   if (typeof XMLHttpRequest !== "undefined") {
     var origOpen = XMLHttpRequest.prototype.open;
     var origSend = XMLHttpRequest.prototype.send;
@@ -588,7 +674,7 @@ export function buildClientShimScript(): string {
     };
   }
 
-  // 5. Patch navigator.sendBeacon
+  // 6. Patch navigator.sendBeacon
   if (typeof navigator !== "undefined" && typeof navigator.sendBeacon === "function") {
     var origBeacon = navigator.sendBeacon.bind(navigator);
     navigator.sendBeacon = function (url, data) {
@@ -596,11 +682,40 @@ export function buildClientShimScript(): string {
     };
   }
 
-  // 6. Patch Worker
+  // 7. Patch Worker with a lightweight tunnel bootstrap for proxied workers
   if (typeof window.Worker === "function") {
     var OrigWorker = window.Worker;
     window.Worker = function (scriptURL, options) {
       var target = typeof scriptURL === "string" ? rewriteUrl(scriptURL) : rewriteUrl(String(scriptURL));
+      if (
+        typeof Blob === "function" &&
+        typeof URL !== "undefined" &&
+        typeof URL.createObjectURL === "function" &&
+        target.indexOf(PROXY_PREFIX) === 0 &&
+        (!options || options.type !== "module")
+      ) {
+        try {
+          var absTarget = window.location.origin + target;
+          var bootstrap =
+            "(function(){" +
+            "var ORIGIN=" + JSON.stringify(window.location.origin) + ";" +
+            "var SUFFIXES=" + JSON.stringify(ALLOWED_SUFFIXES) + ";" +
+            "function rw(u){" +
+            "if(typeof u!=='string'||!u)return u;" +
+            "if(u.indexOf('/_proxy/')===0)return ORIGIN+u;" +
+            "try{var n=u.indexOf('//')===0?'https:'+u:u;if(!/^https?:\\/\\//i.test(n))return u;" +
+            "var p=new URL(n);var h=p.hostname.toLowerCase();" +
+            "for(var i=0;i<SUFFIXES.length;i++){var s=SUFFIXES[i];if(h===s||h.endsWith('.'+s))return ORIGIN+'/_proxy/'+h+p.pathname+p.search+p.hash;}" +
+            "}catch(_){}return u;}" +
+            "if(self.fetch){var of=self.fetch;self.fetch=function(a,b){if(typeof a==='string')a=rw(a);return of.call(this,a,b);};}" +
+            "if(self.XMLHttpRequest){var oo=self.XMLHttpRequest.prototype.open;self.XMLHttpRequest.prototype.open=function(m,u){var ar=Array.prototype.slice.call(arguments);if(typeof u==='string')ar[1]=rw(u);return oo.apply(this,ar);};}" +
+            "if(self.importScripts){var oi=self.importScripts;self.importScripts=function(){var ar=[];for(var i=0;i<arguments.length;i++)ar.push(rw(String(arguments[i])));return oi.apply(this,ar);};}" +
+            "importScripts(" + JSON.stringify(absTarget) + ");" +
+            "})();";
+          var blobUrl = URL.createObjectURL(new Blob([bootstrap], { type: "application/javascript" }));
+          return options ? new OrigWorker(blobUrl, options) : new OrigWorker(blobUrl);
+        } catch (_) {}
+      }
       return options ? new OrigWorker(target, options) : new OrigWorker(target);
     };
     window.Worker.prototype = OrigWorker.prototype;
@@ -742,17 +857,104 @@ export function buildClientShimScript(): string {
       });
     }
 
-    window.addEventListener("wheel", unlockScrollIfNoDialog, { capture: true, passive: true });
-    window.addEventListener("touchmove", unlockScrollIfNoDialog, { capture: true, passive: true });
+    function findFeedScrollContainer() {
+      var col = document.querySelector('[class*="DivColumnListContainer"]');
+      if (col && col.scrollHeight > col.clientHeight + 20) {
+        return col;
+      }
+      return null;
+    }
+
+    var feedScrollLockUntil = 0;
+    function scheduleFeedScrollFallback(direction) {
+      if (hasVisibleDialog()) return;
+      var col = findFeedScrollContainer();
+      if (!col) return;
+      var now = Date.now();
+      if (now < feedScrollLockUntil) return;
+      var prevTop = col.scrollTop;
+      setTimeout(function () {
+        if (hasVisibleDialog()) return;
+        if (Math.abs(col.scrollTop - prevTop) > 10) return;
+        feedScrollLockUntil = Date.now() + 350;
+        var step = col.clientHeight || window.innerHeight || 500;
+        var maxTop = Math.max(0, col.scrollHeight - col.clientHeight);
+        var nextTop = Math.max(0, Math.min(maxTop, prevTop + (direction > 0 ? step : -step)));
+        if (nextTop !== prevTop) {
+          col.style.overflowY = "auto";
+          col.scrollTo({ top: nextTop, behavior: "smooth" });
+        }
+      }, 90);
+    }
+
+    window.addEventListener(
+      "wheel",
+      function (e) {
+        unlockScrollIfNoDialog();
+        if (e && typeof e.deltaY === "number" && Math.abs(e.deltaY) >= 15) {
+          scheduleFeedScrollFallback(e.deltaY > 0 ? 1 : -1);
+        }
+      },
+      { capture: true, passive: true }
+    );
+    window.addEventListener(
+      "touchmove",
+      function () {
+        unlockScrollIfNoDialog();
+      },
+      { capture: true, passive: true }
+    );
     window.addEventListener(
       "keydown",
       function (e) {
-        if (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "PageDown" || e.key === "PageUp") {
+        if (e.key === "ArrowDown" || e.key === "PageDown") {
           unlockScrollIfNoDialog();
+          scheduleFeedScrollFallback(1);
+        } else if (e.key === "ArrowUp" || e.key === "PageUp") {
+          unlockScrollIfNoDialog();
+          scheduleFeedScrollFallback(-1);
         }
       },
       true
     );
+
+    document.addEventListener(
+      "click",
+      function (event) {
+        try {
+          var el = event.target && event.target.closest ? event.target.closest("a[href]") : null;
+          if (!el) return;
+          var href = el.getAttribute("href");
+          if (!href) return;
+          var nextPath = rewriteHistoryUrl(href);
+          if (nextPath !== href) {
+            el.setAttribute("href", nextPath);
+          }
+        } catch (_) {}
+      },
+      true
+    );
+
+    if (typeof window.navigation === "object" && window.navigation && typeof window.navigation.addEventListener === "function") {
+      try {
+        window.navigation.addEventListener("navigate", function (event) {
+          try {
+            if (!event || !event.destination || !event.destination.url || !event.cancelable) return;
+            var destUrl = event.destination.url;
+            if (!/^https?:\\/\\//i.test(destUrl)) return;
+            var parsed = new URL(destUrl);
+            if (parsed.origin === window.location.origin) return;
+            if (isAllowedHost(parsed.hostname)) {
+              var nextDest = rewriteHistoryUrl(destUrl);
+              if (nextDest && nextDest !== destUrl) {
+                event.preventDefault();
+                window.location.assign(nextDest);
+              }
+            }
+          } catch (_) {}
+        });
+      } catch (_) {}
+    }
 
     if (document.readyState === "loading") {
       document.addEventListener("DOMContentLoaded", function () {

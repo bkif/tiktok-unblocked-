@@ -45,7 +45,10 @@ const ABSOLUTE_TIKTOK_URL_REGEX =
   /https?:\/\/([a-zA-Z0-9.-]+(?:\.[a-zA-Z0-9.-]+))(\/[^\s"'`<>()\\]*)?/g;
 
 const ESCAPED_TIKTOK_URL_REGEX =
-  /https?:\\\/\\\/([a-zA-Z0-9.-]+(?:\.[a-zA-Z0-9.-]+))(\\\/[^\s"'`<>()\\]*)?/g;
+  /https?:\\\/\\\/([a-zA-Z0-9.-]+(?:\.[a-zA-Z0-9.-]+))((?:\\\/(?:[^\s"'`<>()\\]|\\\/)*)?)?/g;
+
+const UNICODE_ESCAPED_TIKTOK_URL_REGEX =
+  /https?:\\u002[fF]\\u002[fF]([a-zA-Z0-9.-]+(?:\.[a-zA-Z0-9.-]+))((?:\\u002[fF](?:[^\s"'`<>\\]|\\u00[0-9a-fA-F]{2})*)?)/g;
 
 const PROTOCOL_RELATIVE_ATTR_REGEX =
   /((?:src|href|action|poster|data-src)\s*=\s*["'])\/\/([a-zA-Z0-9.-]+(?:\.[a-zA-Z0-9.-]+))(\/[^"']*)?(["'])/gi;
@@ -54,10 +57,16 @@ const QUOTED_PROTOCOL_RELATIVE_REGEX =
   /(["'`])\/\/([a-zA-Z0-9.-]+(?:\.[a-zA-Z0-9.-]+))(\/[^"'`\s<>\\]*)?\1/g;
 
 const ESCAPED_PROTOCOL_RELATIVE_REGEX =
-  /(["'])\\\/\\\/([a-zA-Z0-9.-]+(?:\.[a-zA-Z0-9.-]+))(\\\/[^"'`\s<>\\]*)?\1/g;
+  /(["'])\\\/\\\/([a-zA-Z0-9.-]+(?:\.[a-zA-Z0-9.-]+))((?:\\\/(?:[^\s"'`<>()\\]|\\\/)*)?)\1/g;
+
+const UNICODE_ESCAPED_PROTOCOL_RELATIVE_REGEX =
+  /(["'])\\u002[fF]\\u002[fF]([a-zA-Z0-9.-]+(?:\.[a-zA-Z0-9.-]+))((?:\\u002[fF](?:[^\s"'`<>\\]|\\u00[0-9a-fA-F]{2})*)?)\1/g;
 
 const CSS_PROTOCOL_RELATIVE_REGEX =
   /(url\(\s*["']?)\/\/([a-zA-Z0-9.-]+(?:\.[a-zA-Z0-9.-]+))(\/[^)"']*)?(["']?\s*\))/gi;
+
+const LINK_HEADER_URL_REGEX =
+  /<((?:https?:)?\/\/)([a-zA-Z0-9.-]+(?:\.[a-zA-Z0-9.-]+))(\/[^>]*)?>/gi;
 
 const SCRIPT_OR_LINK_TAG_REGEX = /<(script|link)\b([^>]*)>/gi;
 
@@ -224,9 +233,26 @@ export function rewriteLocationHeader(
   }
 }
 
+export function rewriteLinkHeader(rawLink: string): string {
+  return rawLink.replace(
+    LINK_HEADER_URL_REGEX,
+    (
+      fullMatch,
+      _proto: string,
+      host: string,
+      path: string | undefined
+    ) => {
+      if (!isAllowedHost(host)) {
+        return fullMatch;
+      }
+      return `</_proxy/${host.toLowerCase()}${path ?? ""}>`;
+    }
+  );
+}
+
 /**
  * Rewrites upstream response headers: strips CSP/XFO/HSTS/COOP/COEP,
- * rewrites Location redirects, and rewrites Set-Cookie headers individually.
+ * rewrites Location and Link headers, and rewrites Set-Cookie headers individually.
  */
 export function rewriteResponseHeaders(
   upstreamHeaders: Headers,
@@ -249,6 +275,10 @@ export function rewriteResponseHeaders(
     }
     if (lower === "location") {
       out.set("location", rewriteLocationHeader(value, currentUpstreamHost));
+      return;
+    }
+    if (lower === "link") {
+      out.set("link", rewriteLinkHeader(value));
       return;
     }
     out.set(key, value);
@@ -280,7 +310,7 @@ export function rewriteResponseHeaders(
 }
 
 /**
- * Rewrites TikTok/ByteDance URLs in HTML, CSS, JS, or JSON text to `/_proxy/<host>/...`.
+ * Rewrites TikTok/ByteDance URLs in HTML, CSS, or JSON text to `/_proxy/<host>/...`.
  */
 export function rewriteProxyUrlsInText(text: string): string {
   let rewritten = text.replace(
@@ -300,6 +330,16 @@ export function rewriteProxyUrlsInText(text: string): string {
         return fullMatch;
       }
       return `\\/_proxy\\/${host.toLowerCase()}${path ?? ""}`;
+    }
+  );
+
+  rewritten = rewritten.replace(
+    UNICODE_ESCAPED_TIKTOK_URL_REGEX,
+    (fullMatch, host: string, path: string | undefined) => {
+      if (!isAllowedHost(host)) {
+        return fullMatch;
+      }
+      return `\\u002F_proxy\\u002F${host.toLowerCase()}${path ?? ""}`;
     }
   );
 
@@ -336,6 +376,16 @@ export function rewriteProxyUrlsInText(text: string): string {
         return fullMatch;
       }
       return `${quote}\\/_proxy\\/${host.toLowerCase()}${path ?? ""}${quote}`;
+    }
+  );
+
+  rewritten = rewritten.replace(
+    UNICODE_ESCAPED_PROTOCOL_RELATIVE_REGEX,
+    (fullMatch, quote: string, host: string, path: string | undefined) => {
+      if (!isAllowedHost(host)) {
+        return fullMatch;
+      }
+      return `${quote}\\u002F_proxy\\u002F${host.toLowerCase()}${path ?? ""}${quote}`;
     }
   );
 
@@ -399,9 +449,6 @@ export function isRewritableTextContentType(contentType: string): boolean {
   const lower = contentType.toLowerCase();
   return (
     lower.includes("text/css") ||
-    lower.includes("application/javascript") ||
-    lower.includes("text/javascript") ||
-    lower.includes("application/x-javascript") ||
     lower.includes("application/json") ||
     lower.includes("application/ld+json")
   );
