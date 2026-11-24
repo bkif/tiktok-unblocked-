@@ -13,14 +13,24 @@ export const ALLOWED_EXACT_HOSTS = new Set<string>([
 
 export const ALLOWED_DOMAIN_SUFFIXES: readonly string[] = [
   "tiktok.com",
+  "tiktokv.com",
+  "tiktokv.us",
+  "tiktokv.eu",
+  "tiktokw.us",
+  "tiktokw.eu",
   "tiktokcdn.com",
   "tiktokcdn-eu.com",
   "tiktokcdn-us.com",
-  "tiktokv.com",
-  "byteoversea.com",
-  "ibytedtos.com",
   "ttwstatic.com",
+  "byteoversea.com",
+  "bytedance.com",
+  "bytedanceapi.com",
+  "byteintl.com",
+  "bytegecko.com",
+  "ibytedtos.com",
+  "ibyteimg.com",
   "muscdn.com",
+  "snssdk.com",
 ];
 
 const HOSTNAME_REGEX =

@@ -1,8 +1,16 @@
 import { buildClientShimScript } from "./client-shim";
-import { isAllowedHost, isPrimaryTikTokHost } from "./config";
+import {
+  isAllowedHost,
+  isPrimaryTikTokHost,
+  PRIMARY_DESKTOP_HOST,
+} from "./config";
+
+const UPSTREAM_SPOOFED_ORIGIN = `https://${PRIMARY_DESKTOP_HOST}`;
 
 const STRIPPED_REQUEST_HEADERS = new Set<string>([
   "host",
+  "origin",
+  "referer",
   "connection",
   "keep-alive",
   "transfer-encoding",
@@ -41,12 +49,24 @@ const ESCAPED_TIKTOK_URL_REGEX =
 const PROTOCOL_RELATIVE_ATTR_REGEX =
   /((?:src|href|action|poster|data-src)\s*=\s*["'])\/\/([a-zA-Z0-9.-]+(?:\.[a-zA-Z0-9.-]+))(\/[^"']*)?(["'])/gi;
 
+const QUOTED_PROTOCOL_RELATIVE_REGEX =
+  /(["'`])\/\/([a-zA-Z0-9.-]+(?:\.[a-zA-Z0-9.-]+))(\/[^"'`\s<>\\]*)?\1/g;
+
+const ESCAPED_PROTOCOL_RELATIVE_REGEX =
+  /(["'])\\\/\\\/([a-zA-Z0-9.-]+(?:\.[a-zA-Z0-9.-]+))(\\\/[^"'`\s<>\\]*)?\1/g;
+
 const CSS_PROTOCOL_RELATIVE_REGEX =
   /(url\(\s*["']?)\/\/([a-zA-Z0-9.-]+(?:\.[a-zA-Z0-9.-]+))(\/[^)"']*)?(["']?\s*\))/gi;
 
+const SCRIPT_OR_LINK_TAG_REGEX = /<(script|link)\b([^>]*)>/gi;
+
+const INTEGRITY_OR_CROSSORIGIN_ATTR_REGEX =
+  /\s+(?:integrity|crossorigin)(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+))?/gi;
+
 /**
  * Builds sanitized upstream request headers, stripping Vercel/proxy headers
- * and rewriting Origin/Referer to match the upstream TikTok host.
+ * and force-setting Origin and Referer to https://www.tiktok.com so TikTok
+ * Passport and modal APIs never reject requests coming from *.vercel.app.
  */
 export function buildUpstreamHeaders(
   incomingHeaders: Headers,
@@ -64,44 +84,39 @@ export function buildUpstreamHeaders(
       return;
     }
 
-    if (lower === "origin") {
-      out.set("origin", `https://${targetHost}`);
-      return;
-    }
-
-    if (lower === "referer") {
-      out.set("referer", rewriteIncomingReferer(value, targetHost));
-      return;
-    }
-
     out.set(key, value);
   });
 
   out.set("host", targetHost);
+  out.set("origin", UPSTREAM_SPOOFED_ORIGIN);
+  out.set("referer", rewriteIncomingReferer(incomingHeaders.get("referer")));
   return out;
 }
 
-function rewriteIncomingReferer(rawReferer: string, targetHost: string): string {
-  try {
-    const parsed = new URL(rawReferer);
-    if (parsed.pathname.startsWith("/_proxy/")) {
-      const rest = parsed.pathname.slice("/_proxy/".length);
+function stripProxyPrefixPath(pathname: string): string {
+  for (const prefix of ["/_proxy/", "/internal/proxy/"]) {
+    if (pathname.startsWith(prefix)) {
+      const rest = pathname.slice(prefix.length);
       const slashIdx = rest.indexOf("/");
       if (slashIdx === -1) {
-        if (isAllowedHost(rest)) {
-          return `https://${rest}/`;
-        }
-      } else {
-        const refHost = rest.slice(0, slashIdx);
-        const refPath = rest.slice(slashIdx);
-        if (isAllowedHost(refHost)) {
-          return `https://${refHost}${refPath}${parsed.search}`;
-        }
+        return "/";
       }
+      return rest.slice(slashIdx) || "/";
     }
-    return `https://${targetHost}${parsed.pathname}${parsed.search}`;
+  }
+  return pathname || "/";
+}
+
+function rewriteIncomingReferer(rawReferer: string | null): string {
+  if (!rawReferer) {
+    return `${UPSTREAM_SPOOFED_ORIGIN}/`;
+  }
+  try {
+    const parsed = new URL(rawReferer);
+    const originalPath = stripProxyPrefixPath(parsed.pathname);
+    return `${UPSTREAM_SPOOFED_ORIGIN}${originalPath}${parsed.search}`;
   } catch {
-    return `https://${targetHost}/`;
+    return `${UPSTREAM_SPOOFED_ORIGIN}/`;
   }
 }
 
@@ -271,6 +286,26 @@ export function rewriteProxyUrlsInText(text: string): string {
   );
 
   rewritten = rewritten.replace(
+    QUOTED_PROTOCOL_RELATIVE_REGEX,
+    (fullMatch, quote: string, host: string, path: string | undefined) => {
+      if (!isAllowedHost(host)) {
+        return fullMatch;
+      }
+      return `${quote}/_proxy/${host.toLowerCase()}${path ?? ""}${quote}`;
+    }
+  );
+
+  rewritten = rewritten.replace(
+    ESCAPED_PROTOCOL_RELATIVE_REGEX,
+    (fullMatch, quote: string, host: string, path: string | undefined) => {
+      if (!isAllowedHost(host)) {
+        return fullMatch;
+      }
+      return `${quote}\\/_proxy\\/${host.toLowerCase()}${path ?? ""}${quote}`;
+    }
+  );
+
+  rewritten = rewritten.replace(
     CSS_PROTOCOL_RELATIVE_REGEX,
     (
       fullMatch,
@@ -290,10 +325,25 @@ export function rewriteProxyUrlsInText(text: string): string {
 }
 
 /**
- * Rewrites HTML URLs and injects the client-side runtime shim into <head>.
+ * Strips `integrity` and `crossorigin` attributes from <script> and <link> tags
+ * so rewritten/proxied bundles never fail Subresource Integrity checks.
+ */
+export function stripIntegrityAndCrossorigin(html: string): string {
+  return html.replace(
+    SCRIPT_OR_LINK_TAG_REGEX,
+    (_fullMatch, tagName: string, attrs: string) => {
+      const cleanedAttrs = attrs.replace(INTEGRITY_OR_CROSSORIGIN_ATTR_REGEX, "");
+      return `<${tagName}${cleanedAttrs}>`;
+    }
+  );
+}
+
+/**
+ * Rewrites HTML URLs, strips SRI attributes, and injects the client-side runtime shim into <head>.
  */
 export function rewriteHtmlDocument(html: string): string {
-  const rewrittenHtml = rewriteProxyUrlsInText(html);
+  const withoutIntegrity = stripIntegrityAndCrossorigin(html);
+  const rewrittenHtml = rewriteProxyUrlsInText(withoutIntegrity);
   const shim = buildClientShimScript();
 
   if (/<head(\s[^>]*)?>/i.test(rewrittenHtml)) {
